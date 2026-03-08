@@ -1,122 +1,135 @@
 import re
+import csv
 import pandas as pd
 import matplotlib.pyplot as plt
 from collections import Counter
+from datetime import datetime
 
-# ==========================================
-# 1. PARSING REAL WORLD LOGS (MEMORY OPTIMIZED)
-# ==========================================
-def parse_apache_log(filepath):
-    print(f"Reading massive {filepath}... (This might take a minute or two, please wait!)")
-    pattern = re.compile(r'(?P<ip>\d+\.\d+\.\d+\.\d+) - - \[.*?\] ".*?" (?P<status>\d+)')
-    
-    # Using Counters saves your computer's RAM from crashing on a 2.4GB file!
-    ip_counts = Counter()
-    scanner_counts = Counter()
+# --- Configuration ---
+APACHE_LOG = 'apache.log'
+AUTH_LOG = 'auth.csv'
+REPORT_FILE = 'incident_report.csv'
+GRAPH_FILE = 'attack_graph.png'
+
+# Simulated Public IP Blacklist (Threat Intelligence)
+KNOWN_THREAT_IPS = {'222.110.193.108', '8.197.178.154', '192.168.1.100'}
+
+def analyze_apache(file_path):
+    print(f"[*] Scanning {file_path} for suspicious web activity...")
+    ip_counter = Counter()
+    ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}'
     
     try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as file:
-            for line in file:
-                match = pattern.search(line)
-                if match:
-                    ip = match.group('ip')
-                    status = match.group('status')
-                    ip_counts[ip] += 1
-                    if status == '404':
-                        scanner_counts[ip] += 1
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if ' 401 ' in line or ' 403 ' in line:
+                    match = re.search(ip_pattern, line)
+                    if match:
+                        ip_counter[match.group()] += 1
+        return ip_counter
     except FileNotFoundError:
-        print(f"Warning: Could not find {filepath}. Check your folder to make sure it is there!")
+        print(f"[-] Error: Could not find '{file_path}'.")
+        return Counter()
+
+def analyze_auth(file_path):
+    print(f"[*] Scanning {file_path} for SSH brute-force attempts...")
+    failed_logins = Counter()
+    ip_pattern = r'(\d{1,3}\.){3}\d{1,3}'
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if 'Failed password' in line or 'failure' in line.lower():
+                    match = re.search(ip_pattern, line)
+                    if match:
+                        failed_logins[match.group()] += 1
+        return failed_logins
+    except FileNotFoundError:
+        print(f"[-] Error: Could not find '{file_path}'.")
+        return Counter()
+
+def generate_incident_report(apache_data, auth_data, output_file):
+    print(f"\n[*] Generating automated incident report: {output_file}")
+    flagged_events = []
+    
+    # Process Web Attacks
+    for ip, count in apache_data.items():
+        if count >= 10:
+            threat_level = "High (Blacklisted)" if ip in KNOWN_THREAT_IPS else "Medium"
+            flagged_events.append({
+                'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'IP Address': ip,
+                'Attack Type': 'Web Brute Force / Scanning',
+                'Attempt Count': count,
+                'Threat Intel': threat_level
+            })
+            
+    # Process SSH Attacks
+    for ip, count in auth_data.items():
+        if count >= 5:
+            threat_level = "Critical (Blacklisted)" if ip in KNOWN_THREAT_IPS else "High"
+            flagged_events.append({
+                'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'IP Address': ip,
+                'Attack Type': 'SSH Brute Force',
+                'Attempt Count': count,
+                'Threat Intel': threat_level
+            })
+
+    # Write to CSV
+    try:
+        with open(output_file, 'w', newline='') as csvfile:
+            fieldnames = ['Timestamp', 'IP Address', 'Attack Type', 'Attempt Count', 'Threat Intel']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for event in flagged_events:
+                writer.writerow(event)
+        print(f"[+] Success! Wrote {len(flagged_events)} alerts to {output_file}")
+    except Exception as e:
+        print(f"[-] Error writing report: {e}")
+
+def visualize_attacks(csv_file, graph_file):
+    print(f"[*] Generating visual attack graph: {graph_file}")
+    try:
+        # Load the newly created incident report into a pandas DataFrame
+        df = pd.read_csv(csv_file)
         
-    return ip_counts, scanner_counts
+        if df.empty:
+            print("[-] No data available to graph.")
+            return
 
-def parse_ssh_data(auth_file, sessions_file):
-    try:
-        auth_df = pd.read_csv(auth_file)
-        sessions_df = pd.read_csv(sessions_file)
-    except FileNotFoundError:
-        print("Warning: Could not find the CSV files. Check your folder.")
-        return pd.DataFrame({'ip': []})
+        # Sort the data to get the top 10 most aggressive IPs
+        top_attackers = df.sort_values(by='Attempt Count', ascending=False).head(10)
 
-    # FIX: Rename the 'id' column in sessions_df to 'session' so they match perfectly
-    if 'id' in sessions_df.columns:
-        sessions_df = sessions_df.rename(columns={'id': 'session'})
-
-    # Standardize the IP column name
-    if 'peerIP' in sessions_df.columns:
-        sessions_df = sessions_df.rename(columns={'peerIP': 'ip'})
-    elif 'source_ip' in sessions_df.columns:
-        sessions_df = sessions_df.rename(columns={'source_ip': 'ip'})
-
-    # MERGE databases together using the shared 'session' ID
-    merged_df = pd.merge(auth_df, sessions_df, on='session')
-    
-    # Filter for failed logins
-    failed_logins = merged_df[merged_df['success'].astype(int) == 0]
-    return failed_logins
-
-# ==========================================
-# 2. THREAT DETECTION ENGINE
-# ==========================================
-def detect_threats(ip_counts, scanner_counts, failed_ssh_df):
-    alerts = []
-
-    # Detect DoS (Threshold raised for a massive file)
-    for ip, count in ip_counts.items():
-        if count > 500:
-            alerts.append({'IP': ip, 'Threat': 'Potential DoS', 'Count': count})
-
-    # Detect Scanning (Threshold raised for a massive file)
-    for ip, count in scanner_counts.items():
-        if count >= 100:
-            alerts.append({'IP': ip, 'Threat': 'Directory Scanning (404s)', 'Count': count})
-
-    if not failed_ssh_df.empty:
-        brute_ips = failed_ssh_df['ip'].value_counts()
-        for ip in brute_ips[brute_ips >= 50].index:
-            alerts.append({'IP': ip, 'Threat': 'SSH Brute Force', 'Count': brute_ips[ip]})
-
-    return pd.DataFrame(alerts)
-
-# ==========================================
-# 3. EXPORT & VISUALIZE
-# ==========================================
-def run_analyzer():
-    print("Initializing Log File Analyzer...")
-    
-    # 1. Parse Apache
-    ip_counts, scanner_counts = parse_apache_log('apache.log')
-    
-    # 2. Parse SSH
-    print("Merging SSH Databases...")
-    failed_ssh_df = parse_ssh_data('auth.csv', 'sessions.csv')
-    
-    # 3. Detect Threats
-    print("Hunting for threats...")
-    alerts_df = detect_threats(ip_counts, scanner_counts, failed_ssh_df)
-
-    if alerts_df.empty:
-        print("\nNo threats detected! The data might be clean, or thresholds need adjusting.")
-        return
-
-    # Export CSV
-    alerts_df.to_csv('incident_report.csv', index=False)
-    print("\n--- ENTERPRISE INTRUSION REPORT ---")
-    # Using .to_string() prevents Pandas from hiding rows if there are a lot of threats
-    print(alerts_df.to_string())
-    print("\nReport saved to 'incident_report.csv'")
-
-    # Generate Graph
-    # Combine counts if the same IP did multiple types of attacks
-    graph_data = alerts_df.groupby('IP')['Count'].sum().reset_index()
-    top_10 = graph_data.sort_values(by='Count', ascending=False).head(10)
-    
-    top_10.plot(x='IP', y='Count', kind='bar', color='darkred', legend=False)
-    plt.title('Top 10 Detected Attacks by IP Address')
-    plt.ylabel('Event Count')
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-    plt.savefig('attack_graph.png')
-    print("Graph saved to 'attack_graph.png'")
+        # Plotting with matplotlib
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(top_attackers['IP Address'], top_attackers['Attempt Count'], color='darkred')
+        
+        # Formatting the graph
+        plt.title('Top Malicious IP Addresses by Attempt Volume', fontsize=14, fontweight='bold')
+        plt.xlabel('IP Address', fontsize=12)
+        plt.ylabel('Number of Access Attempts', fontsize=12)
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout() # Ensures labels don't get cut off
+        
+        # Save the graph as a PNG
+        plt.savefig(graph_file)
+        print(f"[+] Success! Attack graph saved as '{graph_file}'")
+        
+    except Exception as e:
+        print(f"[-] Error generating graph: {e}")
 
 if __name__ == "__main__":
-    run_analyzer()
+    print("--- SOC Log Analyzer Initialized ---\n")
+    
+    # 1. Parse Logs
+    apache_results = analyze_apache(APACHE_LOG)
+    auth_results = analyze_auth(AUTH_LOG)
+    
+    # 2. Cross-reference Blacklist & Export CSV
+    generate_incident_report(apache_results, auth_results, REPORT_FILE)
+    
+    # 3. Visualize the Data
+    visualize_attacks(REPORT_FILE, GRAPH_FILE)
+    
+    print("\n--- Analysis Complete ---")
